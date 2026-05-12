@@ -3,7 +3,9 @@ SAC with RGBD Observations — PushCube-v1 on Modal
 
 Prerequisites:
   1. modal secret create wandb-secret WANDB_API_KEY=<your-key>
-  2. modal run modal/sac_pushcube.py
+  2. modal run modal/sac_pushcube.py --task <task-name>
+
+where task names are defined at https://maniskill.readthedocs.io/en/latest/tasks/table_top_gripper/index.html
 """
 
 import modal
@@ -42,7 +44,6 @@ image = (
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-ENV_ID = "PushCube-v1"
 OBS_MODE = "rgb"
 INCLUDE_STATE = True
 CONTROL_MODE = "pd_ee_delta_pos"
@@ -51,7 +52,7 @@ CAMERA_HEIGHT = 64
 
 NUM_ENVS = 8
 NUM_EVAL_ENVS = 16
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = 100_000
 BUFFER_SIZE = 300_000
 BATCH_SIZE = 512
 LEARNING_STARTS = 4_000
@@ -82,11 +83,13 @@ WANDB_GROUP = "SAC"
 @app.function(
     image=image,
     gpu="L4",
-    timeout=6 * 3600,
+    timeout=1 * 3600,
     volumes={RUNS_DIR: volume},
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
-def train():
+def train(task: str = "PushCube-v1"):
+    ENV_ID = task
+
     import os
     import sys
     import random
@@ -492,5 +495,5 @@ def train():
 
 
 @app.local_entrypoint()
-def main():
-    train.remote()
+def main(task: str = "PushCube-v1"):
+    train.remote(task)
