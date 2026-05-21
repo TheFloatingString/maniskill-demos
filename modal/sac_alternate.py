@@ -149,7 +149,7 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
     # ── Derived config ────────────────────────────────────────────────────────
     GRAD_STEPS = int(TRAINING_FREQ * UTD)
     STEPS_PER_ENV = TRAINING_FREQ // NUM_ENVS
-    RUN_NAME = f"PushPull__sac_rgbd__{SEED}__{int(time.time())}"
+    RUN_NAME = f"{TASK_A}_{TASK_B}__sac_rgbd__{SEED}__{int(time.time())}"
     run_dir = f"{RUNS_DIR}/{RUN_NAME}"
     eval_output_dir_a = f"{run_dir}/videos/{TASK_A}"
     eval_output_dir_b = f"{run_dir}/videos/{TASK_B}"
@@ -428,8 +428,10 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
                         )
 
             pbar.set_postfix(
-                push=f"{eval_success[TASK_A]:.2f}",
-                pull=f"{eval_success[TASK_B]:.2f}",
+                **{
+                    TASK_A[:4]: f"{eval_success[TASK_A]:.2f}",
+                    TASK_B[:4]: f"{eval_success[TASK_B]:.2f}",
+                },
                 active=active_task[:4],
             )
             actor.train()
@@ -600,7 +602,7 @@ TASK_PAIRS = {
     "push-pull": (TASK_A, TASK_B),
     "pull-poke": ("PullCubeTool-v1", "PokeCube-v1"),
     "insert-pair": ("PegInsertionSide-v1", "PlugCharger-v1"),
-    "ball-t": ("RollBall-v1", "PushT-v1"),
+    "pick-place": ("PickCube-v1", "PlaceSphere-v1"),
 }
 
 
