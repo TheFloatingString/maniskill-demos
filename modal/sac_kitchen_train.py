@@ -1,21 +1,25 @@
 """
-SAC with RGBD Observations — PushCube-v1 / PullCube-v1 alternating on Modal
+SAC with RGBD Observations — custom KitchenCabinet-v1 scene on Modal
 
-Trains a single SAC policy that alternates between the two tasks every
-SWITCH_FREQ global steps.  Both tasks are evaluated separately with video
-recorded and uploaded to W&B.
+Trains a single SAC policy on a hand-built kitchen scene (see kitchen_env.py):
+one fixed PartNet-Mobility cabinet + a static countertop prop, both placed at
+fixed, predefined poses. The task is to pull the cabinet's drawer open.
+
+Requires the RTX-PRO-6000 GPU type (Vulkan rendering does not work on A100
+containers on Modal -- see memory/modal_vulkan_findings.md).
 
 Prerequisites:
   1. modal secret create wandb-secret WANDB_API_KEY=<your-key>
-  2. modal run modal/sac_alternate.py
+  2. modal run modal/sac_kitchen_train.py
 """
 
 import modal
 
-app = modal.App("sac-multitask")
+app = modal.App("sac-kitchen")
 
 volume = modal.Volume.from_name("maniskill-runs", create_if_missing=True)
 RUNS_DIR = "/runs"
+MANI_SKILL_DATA_DIR = "/root/.maniskill/data"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
@@ -37,18 +41,21 @@ image = (
         'echo \'{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.3.277"}}\''
         " > /etc/vulkan/icd.d/nvidia_icd.json",
     )
+    .env({"MANI_SKILL_DATA_DIR": MANI_SKILL_DATA_DIR})
     .pip_install(["mani_skill", "tyro", "wandb", "tensorboard", "tqdm"])
     .run_commands(
         "mkdir -p /opt/sac",
         "wget -q -O /opt/sac/sac_rgbd.py"
         " https://raw.githubusercontent.com/haosulab/ManiSkill/main/examples/baselines/sac/sac_rgbd.py",
+        # bake the PartNet-Mobility cabinet assets into the image so training
+        # doesn't re-download them on every cold start
+        "python -m mani_skill.utils.download_asset -y partnet_mobility_cabinet",
     )
+    .add_local_python_source("kitchen_env")
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-TASK_A = "PushCube-v1"
-TASK_B = "PullCube-v1"
-SWITCH_FREQ = 1_000  # global steps between task switches
+TASK = "KitchenCabinet-v1"
 
 OBS_MODE = "rgb"
 INCLUDE_STATE = True
@@ -58,7 +65,7 @@ CAMERA_HEIGHT = 64
 
 NUM_ENVS = 64
 NUM_EVAL_ENVS = 16
-TOTAL_TIMESTEPS = 100_000
+TOTAL_TIMESTEPS = 150_000
 BUFFER_SIZE = 300_000
 BATCH_SIZE = 512
 LEARNING_STARTS = 4_000
@@ -83,7 +90,7 @@ SAVE_MODEL = True
 TRACK = True
 WANDB_PROJECT = "ManiSkill"
 WANDB_ENTITY = None
-WANDB_GROUP = "SAC-Multitask"
+WANDB_GROUP = "SAC-Kitchen"
 
 
 @app.function(
@@ -93,7 +100,7 @@ WANDB_GROUP = "SAC-Multitask"
     volumes={RUNS_DIR: volume},
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
-def train(task_a: str = TASK_A, task_b: str = TASK_B):
+def train(task: str = TASK):
     import os
     import sys
     import random
@@ -101,11 +108,9 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
     import glob
     from collections import defaultdict
 
-    # Shadow module-level constants so the rest of the function is unchanged.
-    TASK_A = task_a  # noqa: F841
-    TASK_B = task_b  # noqa: F841
+    TASK_NAME = task  # noqa: F841
 
-    os.environ["MANI_SKILL_DATA_DIR"] = "/root/.maniskill/data"
+    os.environ["MANI_SKILL_DATA_DIR"] = MANI_SKILL_DATA_DIR
     sys.path.insert(0, "/opt/sac")
 
     import tqdm
@@ -125,6 +130,7 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
     from mani_skill.utils.wrappers.record import RecordEpisode
     from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
     import mani_skill.envs
+    import kitchen_env  # noqa: F401 -- registers "KitchenCabinet-v1"
 
     import sac_rgbd
 
@@ -149,12 +155,10 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
     # ── Derived config ────────────────────────────────────────────────────────
     GRAD_STEPS = int(TRAINING_FREQ * UTD)
     STEPS_PER_ENV = TRAINING_FREQ // NUM_ENVS
-    RUN_NAME = f"{TASK_A}_{TASK_B}__sac_rgbd__{SEED}__{int(time.time())}"
+    RUN_NAME = f"{TASK_NAME}__sac_rgbd__{SEED}__{int(time.time())}"
     run_dir = f"{RUNS_DIR}/{RUN_NAME}"
-    eval_output_dir_a = f"{run_dir}/videos/{TASK_A}"
-    eval_output_dir_b = f"{run_dir}/videos/{TASK_B}"
-    os.makedirs(eval_output_dir_a, exist_ok=True)
-    os.makedirs(eval_output_dir_b, exist_ok=True)
+    eval_output_dir = f"{run_dir}/videos/{TASK_NAME}"
+    os.makedirs(eval_output_dir, exist_ok=True)
     print(
         f"Run: {RUN_NAME}  |  grad_steps/iter: {GRAD_STEPS}  |  steps_per_env: {STEPS_PER_ENV}"
     )
@@ -208,73 +212,30 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
             e, NUM_EVAL_ENVS, ignore_terminations=True, record_metrics=True
         )
 
-    envs_a = wrap_train(gym.make(TASK_A, num_envs=NUM_ENVS, **env_kwargs))
-    envs_b = wrap_train(gym.make(TASK_B, num_envs=NUM_ENVS, **env_kwargs))
-    eval_envs_a = wrap_eval(
+    envs = wrap_train(gym.make(TASK_NAME, num_envs=NUM_ENVS, **env_kwargs))
+    eval_envs = wrap_eval(
         gym.make(
-            TASK_A,
+            TASK_NAME,
             num_envs=NUM_EVAL_ENVS,
             human_render_camera_configs=dict(shader_pack="default"),
             **env_kwargs,
         ),
-        eval_output_dir_a,
-    )
-    eval_envs_b = wrap_eval(
-        gym.make(
-            TASK_B,
-            num_envs=NUM_EVAL_ENVS,
-            human_render_camera_configs=dict(shader_pack="default"),
-            **env_kwargs,
-        ),
-        eval_output_dir_b,
+        eval_output_dir,
     )
 
-    assert isinstance(envs_a.single_action_space, gym.spaces.Box)
-    assert isinstance(envs_b.single_action_space, gym.spaces.Box)
+    assert isinstance(envs.single_action_space, gym.spaces.Box)
 
-    max_episode_steps_a = gym_utils.find_max_episode_steps_value(envs_a._env)
-    max_episode_steps_b = gym_utils.find_max_episode_steps_value(envs_b._env)
-    print(
-        f"Max episode steps: {TASK_A}={max_episode_steps_a}, {TASK_B}={max_episode_steps_b}"
-    )
+    max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
+    print(f"Max episode steps: {TASK_NAME}={max_episode_steps}")
 
     # ── Networks ──────────────────────────────────────────────────────────────
-    obs_a, _ = envs_a.reset(seed=SEED)
-    obs_b, _ = envs_b.reset(seed=SEED)
+    obs, _ = envs.reset(seed=SEED)
 
-    # Pad state observations to the larger dim so both tasks share the same
-    # input shape for the single policy.
-    state_dim_a = obs_a["state"].shape[-1] if "state" in obs_a else 0
-    state_dim_b = obs_b["state"].shape[-1] if "state" in obs_b else 0
-    STATE_DIM = max(state_dim_a, state_dim_b)
-    if state_dim_a != state_dim_b:
-        print(
-            f"State dim mismatch: {TASK_A}={state_dim_a}, {TASK_B}={state_dim_b}"
-            f" — padding both to {STATE_DIM}"
-        )
-
-    def pad_obs(obs_dict):
-        if "state" not in obs_dict or obs_dict["state"].shape[-1] == STATE_DIM:
-            return obs_dict
-        pad = STATE_DIM - obs_dict["state"].shape[-1]
-        return {**obs_dict, "state": F.pad(obs_dict["state"].float(), (0, pad))}
-
-    obs_a = pad_obs(obs_a)
-    obs_b = pad_obs(obs_b)
-
-    # Patch the observation space so the replay buffer allocates the correct state size.
-    if state_dim_a != STATE_DIM:
-        import gymnasium.spaces as gym_spaces
-
-        envs_a.single_observation_space.spaces["state"] = gym_spaces.Box(
-            low=-np.inf, high=np.inf, shape=(STATE_DIM,), dtype=np.float32
-        )
-
-    actor = Actor(envs_a, sample_obs=obs_a).to(device)
-    qf1 = SoftQNetwork(envs_a, actor.encoder).to(device)
-    qf2 = SoftQNetwork(envs_a, actor.encoder).to(device)
-    qf1_tgt = SoftQNetwork(envs_a, actor.encoder).to(device)
-    qf2_tgt = SoftQNetwork(envs_a, actor.encoder).to(device)
+    actor = Actor(envs, sample_obs=obs).to(device)
+    qf1 = SoftQNetwork(envs, actor.encoder).to(device)
+    qf2 = SoftQNetwork(envs, actor.encoder).to(device)
+    qf1_tgt = SoftQNetwork(envs, actor.encoder).to(device)
+    qf2_tgt = SoftQNetwork(envs, actor.encoder).to(device)
     qf1_tgt.load_state_dict(qf1.state_dict())
     qf2_tgt.load_state_dict(qf2.state_dict())
 
@@ -288,7 +249,7 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
 
     if AUTOTUNE:
         target_entropy = -torch.prod(
-            torch.Tensor(envs_a.single_action_space.shape).to(device)
+            torch.Tensor(envs.single_action_space.shape).to(device)
         ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
@@ -299,9 +260,7 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
 
     # ── WandB + TensorBoard ───────────────────────────────────────────────────
     config = dict(
-        task_a=TASK_A,
-        task_b=TASK_B,
-        switch_freq=SWITCH_FREQ,
+        task=TASK_NAME,
         obs_mode=OBS_MODE,
         control_mode=CONTROL_MODE,
         camera_width=CAMERA_WIDTH,
@@ -318,8 +277,7 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
         q_lr=Q_LR,
         autotune=AUTOTUNE,
         seed=SEED,
-        env_horizon_a=max_episode_steps_a,
-        env_horizon_b=max_episode_steps_b,
+        env_horizon=max_episode_steps,
     )
     if TRACK:
         wandb.init(
@@ -330,16 +288,16 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
             name=RUN_NAME,
             save_code=True,
             group=WANDB_GROUP,
-            tags=["sac", "rgbd", "multitask"],
+            tags=["sac", "rgbd", "kitchen"],
         )
 
     writer = SummaryWriter(f"{run_dir}/tb")
     logger = Logger(log_wandb=TRACK, tensorboard=writer)
 
     # ── Replay buffer ─────────────────────────────────────────────────────────
-    envs_a.single_observation_space.dtype = np.float32
+    envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
-        env=envs_a,
+        env=envs,
         num_envs=NUM_ENVS,
         buffer_size=BUFFER_SIZE,
         storage_device=torch.device(BUFFER_DEVICE),
@@ -354,26 +312,9 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
     cumulative_times = defaultdict(float)
     global_steps_per_iter = NUM_ENVS * STEPS_PER_ENV
     pbar = tqdm.tqdm(total=TOTAL_TIMESTEPS, desc="Training")
-
-    # Alternating-task state: save each env's obs independently so we can
-    # resume from mid-episode when we switch back.
-    active_task = TASK_A
-    active_envs = envs_a
-    obs = obs_a
-    saved_obs = {TASK_A: obs_a, TASK_B: obs_b}
-    last_switch = 0
-    eval_success = {TASK_A: torch.tensor(0.0), TASK_B: torch.tensor(0.0)}
+    eval_success = torch.tensor(0.0)
 
     while global_step < TOTAL_TIMESTEPS:
-        # ── Task switch ───────────────────────────────────────────────────────
-        if global_step > 0 and global_step - last_switch >= SWITCH_FREQ:
-            saved_obs[active_task] = obs
-            active_task = TASK_B if active_task == TASK_A else TASK_A
-            active_envs = envs_a if active_task == TASK_A else envs_b
-            obs = saved_obs[active_task]
-            last_switch = global_step
-            print(f"[step {global_step}] Switched to {active_task}")
-
         # ── Evaluation ───────────────────────────────────────────────────────
         if (
             EVAL_FREQ > 0
@@ -386,54 +327,36 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
                 and (global_step - TRAINING_FREQ) // VIDEO_LOG_FREQ
                 < global_step // VIDEO_LOG_FREQ
             )
-            for task_tag, eval_envs_cur, out_dir in [
-                (TASK_A, eval_envs_a, eval_output_dir_a),
-                (TASK_B, eval_envs_b, eval_output_dir_b),
-            ]:
-                stime = time.perf_counter()
-                cur_eval_obs, _ = eval_envs_cur.reset()
-                cur_eval_obs = pad_obs(cur_eval_obs)
-                eval_metrics = defaultdict(list)
-                for _ in range(NUM_EVAL_STEPS):
-                    with torch.no_grad():
-                        cur_eval_obs, _, _, _, eval_infos = eval_envs_cur.step(
-                            actor.get_eval_action(cur_eval_obs)
-                        )
-                    cur_eval_obs = pad_obs(cur_eval_obs)
-                    if "final_info" in eval_infos:
-                        for k, v in eval_infos["final_info"]["episode"].items():
-                            eval_metrics[k].append(v)
-                eval_means = {
-                    k: torch.stack(v).float().mean() for k, v in eval_metrics.items()
-                }
-                eval_success[task_tag] = eval_means.get(
-                    "success_once", torch.tensor(0.0)
-                )
-                for k, v in eval_means.items():
-                    logger.add_scalar(f"eval/{task_tag}/{k}", v, global_step)
-                eval_time = time.perf_counter() - stime
-                cumulative_times[f"eval_time_{task_tag}"] += eval_time
-                logger.add_scalar(f"time/eval_time_{task_tag}", eval_time, global_step)
+            stime = time.perf_counter()
+            cur_eval_obs, _ = eval_envs.reset()
+            eval_metrics = defaultdict(list)
+            for _ in range(NUM_EVAL_STEPS):
+                with torch.no_grad():
+                    cur_eval_obs, _, _, _, eval_infos = eval_envs.step(
+                        actor.get_eval_action(cur_eval_obs)
+                    )
+                if "final_info" in eval_infos:
+                    for k, v in eval_infos["final_info"]["episode"].items():
+                        eval_metrics[k].append(v)
+            eval_means = {
+                k: torch.stack(v).float().mean() for k, v in eval_metrics.items()
+            }
+            eval_success = eval_means.get("success_once", torch.tensor(0.0))
+            for k, v in eval_means.items():
+                logger.add_scalar(f"eval/{k}", v, global_step)
+            eval_time = time.perf_counter() - stime
+            cumulative_times["eval_time"] += eval_time
+            logger.add_scalar("time/eval_time", eval_time, global_step)
 
-                if log_video_this_eval:
-                    videos = sorted(glob.glob(f"{out_dir}/*.mp4"))
-                    if videos:
-                        wandb.log(
-                            {
-                                f"eval/{task_tag}/video": wandb.Video(
-                                    videos[-1], fps=30, format="mp4"
-                                )
-                            },
-                            step=global_step,
-                        )
+            if log_video_this_eval:
+                videos = sorted(glob.glob(f"{eval_output_dir}/*.mp4"))
+                if videos:
+                    wandb.log(
+                        {"eval/video": wandb.Video(videos[-1], fps=30, format="mp4")},
+                        step=global_step,
+                    )
 
-            pbar.set_postfix(
-                **{
-                    TASK_A[:4]: f"{eval_success[TASK_A]:.2f}",
-                    TASK_B[:4]: f"{eval_success[TASK_B]:.2f}",
-                },
-                active=active_task[:4],
-            )
+            pbar.set_postfix(success=f"{eval_success:.2f}")
             actor.train()
 
             if SAVE_MODEL:
@@ -453,27 +376,19 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
         for _ in range(STEPS_PER_ENV):
             global_step += NUM_ENVS
             if not learning_has_started:
-                actions = (
-                    2 * torch.rand(active_envs.action_space.shape, device=device) - 1
-                )
+                actions = 2 * torch.rand(envs.action_space.shape, device=device) - 1
             else:
                 with torch.no_grad():
                     actions, _, _, _ = actor.get_action(obs)
-            next_obs, rewards, terminations, truncations, infos = active_envs.step(
-                actions
-            )
-            next_obs = pad_obs(next_obs)
+            next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
             logger.add_scalar("train/reward", rewards.mean().item(), global_step)
-            logger.add_scalar(
-                f"train/{active_task}/reward", rewards.mean().item(), global_step
-            )
 
             real_next_obs = {k: v.clone() for k, v in next_obs.items()}
             need_final_obs = truncations | terminations
             stop_bootstrap = torch.zeros_like(terminations, dtype=torch.bool)
             if "final_info" in infos:
-                final_obs = pad_obs(infos["final_observation"])
+                final_obs = infos["final_observation"]
                 for k in real_next_obs:
                     real_next_obs[k][need_final_obs] = final_obs[k][
                         need_final_obs
@@ -481,9 +396,7 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
                 done_mask = infos["_final_info"]
                 for k, v in infos["final_info"]["episode"].items():
                     logger.add_scalar(
-                        f"train/{active_task}/{k}",
-                        v[done_mask].float().mean(),
-                        global_step,
+                        f"train/{k}", v[done_mask].float().mean(), global_step
                     )
             rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
             obs = next_obs
@@ -592,23 +505,10 @@ def train(task_a: str = TASK_A, task_b: str = TASK_B):
     logger.close()
     if TRACK:
         wandb.finish()
-    envs_a.close()
-    envs_b.close()
-    eval_envs_a.close()
-    eval_envs_b.close()
-
-
-TASK_PAIRS = {
-    "push-pull": (TASK_A, TASK_B),
-    "pull-poke": ("PullCubeTool-v1", "PokeCube-v1"),
-    "insert-pair": ("PegInsertionSide-v1", "PlugCharger-v1"),
-    "pick-place": ("PickCube-v1", "PlaceSphere-v1"),
-}
+    envs.close()
+    eval_envs.close()
 
 
 @app.local_entrypoint()
-def main(pair: str = "push-pull"):
-    if pair not in TASK_PAIRS:
-        raise ValueError(f"Unknown pair {pair!r}. Choose from: {list(TASK_PAIRS)}")
-    task_a, task_b = TASK_PAIRS[pair]
-    train.remote(task_a, task_b)
+def main(task: str = TASK):
+    train.remote(task)
